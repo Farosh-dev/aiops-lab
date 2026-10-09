@@ -1,0 +1,31 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: aiops-lab-rules
+  namespace: monitoring
+  labels:
+    release: monitoring
+spec:
+  groups:
+  - name: aiops-lab.pods
+    rules:
+    - alert: PodCrashLooping
+      expr: increase(kube_pod_container_status_restarts_total{namespace="default"}[5m]) > 2
+      for: 1m
+      labels:
+        severity: critical
+      annotations:
+        summary: "Pod {{ $labels.pod }} is restarting repeatedly"
+    - alert: PodImagePullFailing
+      expr: kube_pod_container_status_waiting_reason{namespace="default", reason=~"ErrImagePull|ImagePullBackOff"} == 1
+      for: 1m
+      labels:
+        severity: warning
+      annotations:
+        summary: "Pod {{ $labels.pod }} cannot pull its image"
+    - alert: PodOOMKilled
+      expr: kube_pod_container_status_last_terminated_reason{namespace="default", reason="OOMKilled"} == 1
+      labels:
+        severity: critical
+      annotations:
+        summary: "Pod {{ $labels.pod }} was OOMKilled"
