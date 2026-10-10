@@ -65,6 +65,7 @@ Requirements: a machine with about 16 GB of RAM, Windows 11 with WSL2 or Linux/m
 aiops-lab/
 ├── phase0-notes.md          Phase 0 summary
 ├── phase1/                  app.yaml, crash.yaml, oom.yaml
+├── phase2-notes.md          Phase 2 summary (install notes, no manifests)
 ├── phase3/                  rules.yaml, triggers.yaml
 ├── phase4/                  main.tf, .terraform.lock.hcl, .gitignore
 ├── phase5/                  loki-values.yaml, alloy-values.yaml, logdemo.yaml
