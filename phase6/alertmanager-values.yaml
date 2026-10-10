@@ -1,0 +1,23 @@
+alertmanager:
+  config:
+    global:
+      resolve_timeout: 5m
+    route:
+      receiver: "null"
+      group_by: ["namespace", "alertname"]
+      group_wait: 10s
+      group_interval: 1m
+      repeat_interval: 30m
+      routes:
+      - receiver: "null"
+        matchers:
+        - alertname = "Watchdog"
+      - receiver: remediator
+        matchers:
+        - alertname =~ "PodImagePullFailing|PodOOMKilled|PodCrashLooping"
+    receivers:
+    - name: "null"
+    - name: remediator
+      webhook_configs:
+      - url: http://remediator.remediation.svc.cluster.local:8080/alert
+        send_resolved: true

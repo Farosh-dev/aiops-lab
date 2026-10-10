@@ -1,0 +1,77 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: remediation
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: remediator-app
+  namespace: remediation
+data:
+  app.py: |
+    import json
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length) or b"{}")
+            for alert in body.get("alerts", []):
+                labels = alert.get("labels", {})
+                print(json.dumps({
+                    "event": "alert_received",
+                    "status": alert.get("status"),
+                    "alertname": labels.get("alertname"),
+                    "namespace": labels.get("namespace"),
+                    "pod": labels.get("pod"),
+                }), flush=True)
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    print("remediator listening on :8080", flush=True)
+    HTTPServer(("", 8080), Handler).serve_forever()
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: remediator
+  namespace: remediation
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: remediator
+  template:
+    metadata:
+      labels:
+        app: remediator
+    spec:
+      containers:
+      - name: app
+        image: python:3.12-slim
+        command: ["python", "-u", "/app/app.py"]
+        ports:
+        - containerPort: 8080
+        volumeMounts:
+        - name: code
+          mountPath: /app
+      volumes:
+      - name: code
+        configMap:
+          name: remediator-app
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: remediator
+  namespace: remediation
+spec:
+  selector:
+    app: remediator
+  ports:
+  - port: 8080
+    targetPort: 8080
