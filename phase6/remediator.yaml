@@ -4,6 +4,42 @@ metadata:
   name: remediation
 ---
 apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: remediator
+  namespace: remediation
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: remediator
+  namespace: default
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get"]
+- apiGroups: ["apps"]
+  resources: ["replicasets"]
+  verbs: ["get", "list"]
+- apiGroups: ["apps"]
+  resources: ["deployments"]
+  verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: remediator
+  namespace: default
+subjects:
+- kind: ServiceAccount
+  name: remediator
+  namespace: remediation
+roleRef:
+  kind: Role
+  name: remediator
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: v1
 kind: ConfigMap
 metadata:
   name: remediator-app
@@ -11,28 +47,191 @@ metadata:
 data:
   app.py: |
     import json
+    import os
+    import ssl
+    import time
+    import urllib.error
+    import urllib.parse
+    import urllib.request
     from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    API = "https://kubernetes.default.svc"
+    SA = "/var/run/secrets/kubernetes.io/serviceaccount"
+    CTX = ssl.create_default_context(cafile=SA + "/ca.crt")
+
+    DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+    ALLOWED_NAMESPACES = {"default"}
+    OPT_IN = "aiops-lab/auto-remediate"
+    REVISION = "deployment.kubernetes.io/revision"
+    COOLDOWN_SECONDS = 300
+    MAX_MEMORY_MI = 512
+    last_action = {}
+
+
+    def log(level, event, **fields):
+        print(json.dumps({"level": level, "event": event, **fields}), flush=True)
+
+
+    def api(method, path, body=None, content_type="application/json"):
+        token = open(SA + "/token").read().strip()
+        data = json.dumps(body).encode() if body is not None else None
+        req = urllib.request.Request(
+            API + path, data=data, method=method,
+            headers={"Authorization": "Bearer " + token,
+                     "Content-Type": content_type,
+                     "Accept": "application/json"})
+        with urllib.request.urlopen(req, context=CTX, timeout=10) as resp:
+            return json.loads(resp.read())
+
+
+    def rev(obj):
+        return int(obj["metadata"].get("annotations", {}).get(REVISION, "0"))
+
+
+    def owner_name(obj, kind):
+        for ref in obj["metadata"].get("ownerReferences", []):
+            if ref.get("kind") == kind:
+                return ref["name"]
+        return None
+
+
+    def find_deployment(ns, pod_name):
+        pod = api("GET", f"/api/v1/namespaces/{ns}/pods/{pod_name}")
+        rs_name = owner_name(pod, "ReplicaSet")
+        if not rs_name:
+            return None
+        rs = api("GET", f"/apis/apps/v1/namespaces/{ns}/replicasets/{rs_name}")
+        dep_name = owner_name(rs, "Deployment")
+        if not dep_name:
+            return None
+        dep = api("GET", f"/apis/apps/v1/namespaces/{ns}/deployments/{dep_name}")
+        return dep, rs
+
+
+    def previous_replicaset(dep):
+        ns = dep["metadata"]["namespace"]
+        name = dep["metadata"]["name"]
+        labels = dep["spec"]["selector"]["matchLabels"]
+        selector = urllib.parse.quote(",".join(f"{k}={v}" for k, v in labels.items()))
+        items = api("GET", f"/apis/apps/v1/namespaces/{ns}/replicasets?labelSelector={selector}")["items"]
+        older = [r for r in items
+                 if owner_name(r, "Deployment") == name and rev(r) < rev(dep)]
+        return max(older, key=rev) if older else None
+
+
+    def rollback(dep, target):
+        ns = dep["metadata"]["namespace"]
+        name = dep["metadata"]["name"]
+        template = target["spec"]["template"]
+        template["metadata"]["labels"].pop("pod-template-hash", None)
+        api("PATCH", f"/apis/apps/v1/namespaces/{ns}/deployments/{name}",
+            {"spec": {"template": template}}, "application/merge-patch+json")
+
+
+    def memory_mi(value):
+        if value.endswith("Gi"):
+            return int(float(value[:-2]) * 1024)
+        if value.endswith("Mi"):
+            return int(float(value[:-2]))
+        return None
+
+
+    def raise_memory(dep, container):
+        for c in dep["spec"]["template"]["spec"]["containers"]:
+            if c["name"] == container:
+                current = memory_mi(c.get("resources", {}).get("limits", {}).get("memory", ""))
+                if current is None:
+                    return None
+                new = min(current * 2, MAX_MEMORY_MI)
+                return (current, new) if new > current else None
+        return None
+
+
+    def patch_memory(dep, container, new):
+        ns = dep["metadata"]["namespace"]
+        name = dep["metadata"]["name"]
+        body = {"spec": {"template": {"spec": {"containers": [
+            {"name": container, "resources": {"limits": {"memory": f"{new}Mi"}}}]}}}}
+        api("PATCH", f"/apis/apps/v1/namespaces/{ns}/deployments/{name}",
+            body, "application/strategic-merge-patch+json")
+
+
+    def handle(alert):
+        labels = alert.get("labels", {})
+        name = labels.get("alertname")
+        ns = labels.get("namespace")
+        pod = labels.get("pod")
+        container = labels.get("container")
+        base = {"alertname": name, "namespace": ns, "pod": pod}
+        if alert.get("status") != "firing":
+            log("info", "alert_resolved", **base)
+            return
+        log("info", "alert_received", **base)
+        if name not in ("PodImagePullFailing", "PodOOMKilled"):
+            log("info", "no_automatic_fix", reason="needs a human", **base)
+            return
+        if ns not in ALLOWED_NAMESPACES:
+            log("info", "skipped", reason="namespace not allowed", **base)
+            return
+        try:
+            found = find_deployment(ns, pod)
+        except urllib.error.HTTPError as err:
+            log("warning", "skipped", reason=f"lookup failed with HTTP {err.code}", **base)
+            return
+        if not found:
+            log("info", "skipped", reason="pod has no Deployment owner", **base)
+            return
+        dep, rs = found
+        dep_name = dep["metadata"]["name"]
+        base["deployment"] = dep_name
+        if dep["metadata"].get("annotations", {}).get(OPT_IN) != "true":
+            log("info", "skipped", reason="deployment has not opted in", **base)
+            return
+        if rev(rs) != rev(dep):
+            log("info", "skipped", reason="pod belongs to an old revision", **base)
+            return
+        action = "rollback" if name == "PodImagePullFailing" else "raise_memory"
+        key = (ns, dep_name, action)
+        if time.time() - last_action.get(key, 0) < COOLDOWN_SECONDS:
+            log("info", "skipped", reason="cooldown", action=action, **base)
+            return
+        if action == "rollback":
+            target = previous_replicaset(dep)
+            if target is None:
+                log("warning", "skipped", reason="no previous revision", action=action, **base)
+                return
+            detail = {"from_revision": rev(dep), "to_revision": rev(target)}
+            if not DRY_RUN:
+                rollback(dep, target)
+        else:
+            change = raise_memory(dep, container)
+            if change is None:
+                log("warning", "skipped", reason="cannot raise memory", action=action, **base)
+                return
+            detail = {"container": container, "from_mi": change[0], "to_mi": change[1]}
+            if not DRY_RUN:
+                patch_memory(dep, container, change[1])
+        last_action[key] = time.time()
+        log("info", "dry_run" if DRY_RUN else "remediated", action=action, **detail, **base)
+
 
     class Handler(BaseHTTPRequestHandler):
         def do_POST(self):
             length = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(length) or b"{}")
             for alert in body.get("alerts", []):
-                labels = alert.get("labels", {})
-                print(json.dumps({
-                    "event": "alert_received",
-                    "status": alert.get("status"),
-                    "alertname": labels.get("alertname"),
-                    "namespace": labels.get("namespace"),
-                    "pod": labels.get("pod"),
-                }), flush=True)
+                try:
+                    handle(alert)
+                except Exception as err:
+                    log("error", "handler_error", error=str(err))
             self.send_response(200)
             self.end_headers()
 
         def log_message(self, *args):
             pass
 
-    print("remediator listening on :8080", flush=True)
+
+    log("info", "started", dry_run=DRY_RUN, cooldown_seconds=COOLDOWN_SECONDS)
     HTTPServer(("", 8080), Handler).serve_forever()
 ---
 apiVersion: apps/v1
@@ -50,10 +249,14 @@ spec:
       labels:
         app: remediator
     spec:
+      serviceAccountName: remediator
       containers:
       - name: app
         image: python:3.12-slim
         command: ["python", "-u", "/app/app.py"]
+        env:
+        - name: DRY_RUN
+          value: "true"
         ports:
         - containerPort: 8080
         volumeMounts:

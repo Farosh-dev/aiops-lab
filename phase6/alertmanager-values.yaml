@@ -13,6 +13,7 @@ alertmanager:
         matchers:
         - alertname = "Watchdog"
       - receiver: remediator
+        repeat_interval: 2m
         matchers:
         - alertname =~ "PodImagePullFailing|PodOOMKilled|PodCrashLooping"
     receivers:

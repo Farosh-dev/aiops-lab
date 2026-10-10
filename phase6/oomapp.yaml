@@ -1,0 +1,26 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: oomapp
+  annotations:
+    aiops-lab/auto-remediate: "true"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: oomapp
+  template:
+    metadata:
+      labels:
+        app: oomapp
+    spec:
+      containers:
+      - name: hog
+        image: polinux/stress
+        command: ["stress"]
+        args: ["--vm", "1", "--vm-bytes", "60M", "--vm-hang", "1"]
+        resources:
+          requests:
+            memory: 32Mi
+          limits:
+            memory: 50Mi
